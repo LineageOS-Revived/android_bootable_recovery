@@ -20,6 +20,9 @@
 #include <fcntl.h>
 #include <string.h>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,12 +31,15 @@
 #include <android-base/file.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <fstab/fstab.h>
 
 #ifndef __ANDROID__
 #include <cutils/memory.h>  // for strlcpy
 #endif
+
+static constexpr const char* COMMAND_FILE = "/cache/recovery/command";
 
 using android::fs_mgr::Fstab;
 using android::fs_mgr::ReadDefaultFstab;
@@ -153,7 +159,14 @@ bool read_bootloader_message_from(bootloader_message* boot, const std::string& m
 bool read_bootloader_message(bootloader_message* boot, std::string* err) {
   std::string misc_blk_device = get_misc_blk_device(err);
   if (misc_blk_device.empty()) {
-    return false;
+    *boot = {};
+    std::string content;
+    if (android::base::ReadFileToString(COMMAND_FILE, &content)) {
+      strlcpy(boot->command, "boot-recovery", sizeof(boot->command));
+      std::string recovery = "recovery\n" + content;
+      strlcpy(boot->recovery, recovery.c_str(), sizeof(boot->recovery));
+    }
+    return true;
   }
   return read_bootloader_message_from(boot, misc_blk_device, err);
 }
@@ -167,26 +180,61 @@ bool write_bootloader_message_to(const bootloader_message& boot, const std::stri
 bool write_bootloader_message(const bootloader_message& boot, std::string* err) {
   std::string misc_blk_device = get_misc_blk_device(err);
   if (misc_blk_device.empty()) {
-    return false;
+    mkdir("/cache/recovery", 0770);
+    std::string content(boot.recovery);
+    static constexpr const char* RECOVERY_PREFIX = "recovery\n";
+    if (android::base::StartsWith(content, RECOVERY_PREFIX)) {
+      content = content.substr(strlen(RECOVERY_PREFIX));
+    }
+    if (!android::base::WriteStringToFile(content, COMMAND_FILE)) {
+      *err = "Failed to write to " + std::string(COMMAND_FILE) + ": " + strerror(errno);
+      return false;
+    }
+    chmod(COMMAND_FILE, 0660);
+    return true;
   }
   return write_bootloader_message_to(boot, misc_blk_device, err);
 }
 
 bool clear_bootloader_message(std::string* err) {
+  std::string misc_blk_device = get_misc_blk_device(err);
+  if (misc_blk_device.empty()) {
+    if (unlink(COMMAND_FILE) != 0 && errno != ENOENT) {
+      *err = "Failed to unlink " + std::string(COMMAND_FILE) + ": " + strerror(errno);
+      return false;
+    }
+    return true;
+  }
   bootloader_message boot = {};
   if (BOOTLOADER_MESSAGE_OFFSET_IN_MISC < sizeof(bootloader_message)) {
-    std::string misc_blk_device = get_misc_blk_device(err);
-    if (misc_blk_device.empty()) return false;
     return write_misc_partition(&boot, sizeof(boot), misc_blk_device, 0 /* offset */, err);
   }
   return write_bootloader_message(boot, err);
 }
 
 bool write_bootloader_message(const std::vector<std::string>& options, std::string* err) {
+  std::string misc_blk_device = get_misc_blk_device(err);
+  if (misc_blk_device.empty()) {
+    mkdir("/cache/recovery", 0770);
+    std::string content;
+    for (const auto& s : options) {
+      content += s;
+      if (s.empty() || s.back() != '\n') {
+        content += '\n';
+      }
+    }
+    if (!android::base::WriteStringToFile(content, COMMAND_FILE)) {
+      *err = "Failed to write to " + std::string(COMMAND_FILE) + ": " + strerror(errno);
+      return false;
+    }
+    chmod(COMMAND_FILE, 0660);
+    return true;
+  }
+
   bootloader_message boot = {};
   update_bootloader_message_in_struct(&boot, options);
 
-  return write_bootloader_message(boot, err);
+  return write_bootloader_message_to(boot, misc_blk_device, err);
 }
 
 bool write_bootloader_message_to(const std::vector<std::string>& options,
